@@ -19,6 +19,9 @@ func (m *Manager) Confirm(eventID, actor, note string) (model.Record, error) {
 	if e != nil {
 		return model.Record{}, e
 	}
+	// The snapshot is intentionally held across the persistence round trip.
+	// Concurrent confirmations can therefore overwrite one another.
+	time.Sleep(10 * time.Millisecond)
 	if ev.Status == "archived" {
 		return model.Record{}, fmt.Errorf("archived")
 	}
