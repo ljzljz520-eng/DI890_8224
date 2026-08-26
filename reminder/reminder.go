@@ -14,23 +14,38 @@ type Manager struct {
 }
 
 func New(s *store.Store) *Manager { return &Manager{Store: s} }
+
+// lockFor returns a per-event mutex so concurrent confirmations of the same
+// event are serialized instead of clobbering each other's notes.
+func (m *Manager) lockFor(eventID string) *sync.Mutex {
+	v, _ := m.locks.LoadOrStore(eventID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 func (m *Manager) Confirm(eventID, actor, note string) (model.Record, error) {
+	mu := m.lockFor(eventID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	ev, e := m.Store.GetEvent(eventID)
 	if e != nil {
 		return model.Record{}, e
 	}
-	// The snapshot is intentionally held across the persistence round trip.
-	// Concurrent confirmations can therefore overwrite one another.
+	// Model the persistence round-trip latency. The per-event lock held above
+	// serializes concurrent confirmations, so this window can no longer let one
+	// confirmation overwrite another's note.
 	time.Sleep(10 * time.Millisecond)
-	if ev.Status == "archived" {
-		return model.Record{}, fmt.Errorf("archived")
+	if !CanConfirm(ev, actor) {
+		return model.Record{}, fmt.Errorf("event not confirmable: %s", ev.Status)
 	}
 	rec := model.Record{ID: fmt.Sprintf("%s-%s-%d", eventID, actor, time.Now().UnixNano()), EventID: eventID, Content: note, ConfirmedBy: actor, ConfirmedAt: time.Now().UTC().Format(time.RFC3339), Version: 1}
 	if e = m.Store.SaveRecord(rec); e != nil {
 		return rec, e
 	}
+	// Merge with any note already recorded so both confirmations survive,
+	// rather than the later submitter overwriting the earlier one.
 	ev.Status = "confirmed"
-	ev.ReminderNote = note
+	ev.ReminderNote = MergeNotes(ev.ReminderNote, note)
 	if e = m.Store.SaveEvent(ev); e != nil {
 		return rec, e
 	}
